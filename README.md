@@ -23,8 +23,12 @@ The repository is organized in this way:
 
 Tips
 ==============
+
+We report some suggestions useful to handle the code:
 - **NOMAD_tuned.patch** depends on NOMAD.patch. 
 - **NOMAD.patch** depends on commit 7f4140758ee0660e23303305a2634ef442a76114
 
 Usage
 ==============
+
+We report the usage of our scripts:
