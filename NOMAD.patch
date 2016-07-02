@@ -1,0 +1,2849 @@
+From 1c7b7bcdfc1e2ff88084b2a5ff32d15abe568487 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Wed, 24 Feb 2016 19:24:30 +0100
+Subject: [PATCH 01/15] Changes: - Add Leonardo's code
+
+Warning:
+- Make fail, some APIs are changed
+---
+ client/driver/driver.go |   1 +
+ client/driver/xen.go    | 160 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 161 insertions(+)
+ create mode 100644 client/driver/xen.go
+
+diff --git a/client/driver/driver.go b/client/driver/driver.go
+index db808b1..a8d5443 100644
+--- a/client/driver/driver.go
++++ b/client/driver/driver.go
+@@ -25,6 +25,7 @@ var BuiltinDrivers = map[string]Factory{
+ 	"java":     NewJavaDriver,
+ 	"qemu":     NewQemuDriver,
+ 	"rkt":      NewRktDriver,
++	"xen":		NewXenDriver,
+ }
+ 
+ // NewDriver is used to instantiate and return a new driver
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+new file mode 100644
+index 0000000..be6a4c5
+--- /dev/null
++++ b/client/driver/xen.go
+@@ -0,0 +1,160 @@
++package driver
++
++import (
++	"fmt"
++	"os/exec"
++	"regexp"
++	"strings"
++	"time"
++
++	"github.com/hashicorp/nomad/client/config"
++	"github.com/hashicorp/nomad/client/driver/executor"
++	cstructs "github.com/hashicorp/nomad/client/driver/structs"
++	"github.com/hashicorp/nomad/client/fingerprint"
++	"github.com/hashicorp/nomad/nomad/structs"
++)
++
++var (
++	reMajVersion = regexp.MustCompile(`xen_major:'d'`)
++    	reMinVersion = regexp.MustCompile(`xen_minor:'d'`)
++    	reExtVersion = regexp.MustCompile(`xen_extra:.'d'`)
++)
++
++// XenDriver is a driver for running Xen.
++type XenDriver struct {
++	DriverContext
++	fingerprint.StaticFingerprinter
++}
++
++// Configuration for XenDriver
++type XenDriverConfig struct {
++	ArtifactSource string           `mapstructure:"artifact_source"`
++	Checksum       string           `mapstructure:"checksum"`
++	Accelerator    string           `mapstructure:"accelerator"`
++	PortMap        []map[string]int `mapstructure:"port_map"` // A map of host port labels and to guest ports.
++}
++
++// xenHandle is returned from Start/Open as a handle to the PID (identical to qemu and java).
++type xenHandle struct {
++	cmd    executor.Executor
++	waitCh chan *cstructs.WaitResult
++	doneCh chan struct{}
++}
++
++// NewXenDriver is used to create a new exec driver (identical to qemu and java).
++func NewXenDriver(ctx *DriverContext) Driver {
++	return &XenDriver{DriverContext: *ctx}
++}
++
++// Return the driver to be used
++func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
++bin := "xl"
++	
++	outBytes, err := exec.Command(bin, "info").Output()
++	if err != nil {
++		return false, nil
++	}
++	out := strings.TrimSpace(string(outBytes))
++
++	matches1 := reMajVersion.FindStringSubmatch(out)
++	if len(matches1) != 2 {
++		return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches1)
++	}
++    	matches2 := reMinVersion.FindStringSubmatch(out)
++        if len(matches2) != 2 {
++        	return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches2)
++    	}
++    	matches3 := reExtVersion.FindStringSubmatch(out)
++        if len(matches3) != 2 {
++        	return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches3)
++    	}
++
++    	matches := matches1[1]+"."+matches2[1]+"."+matches3[1]
++
++	node.Attributes["driver.xen-hyp"] = "1"
++	node.Attributes["driver.xen-hyp.version"] = matches
++
++	return true, nil
++}
++
++
++// Run an existing Xen image. Start() will pull down an existing, valid Xen
++// image and save it to the Drivers Allocation Dir
++func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
++	/*
++	// Xen defaults to 256M of RAM for a given VM. Instead, we force users to
++	// supply a memory size in the tasks resources
++	if task.Resources == nil || task.Resources.MemoryMB == 0 {
++		return nil, fmt.Errorf("Missing required Task Resource: Memory")
++	}*/
++	
++	args := []string{
++                "xl",
++                "create",
++                "/root/clickos.cfg",
++	}
++	
++	// Setup the command
++	cmd := executor.Command(args[0], args[1:]...)
++	d.logger.Printf("[DEBUG] Starting XenVM command: %q", strings.Join(args, " "))
++	
++	// Create and Return Handle
++        h := &execHandle{
++                cmd:    cmd,
++                doneCh: make(chan struct{}),
++                waitCh: make(chan *cstructs.WaitResult, 1),
++        }
++
++        go h.run()
++        return h, nil
++}
++
++func (d *XenDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
++	// Find the process
++	cmd, err := executor.OpenId(handleID)
++	if err != nil {
++		return nil, fmt.Errorf("failed to open ID %v: %v", handleID, err)
++	}
++
++	// Return a driver handle
++	h := &execHandle{
++		cmd:    cmd,
++		doneCh: make(chan struct{}),
++		waitCh: make(chan *cstructs.WaitResult, 1),
++	}
++	go h.run()
++	return h, nil
++}
++
++func (h *xenHandle) ID() string {
++	id, _ := h.cmd.ID()
++	return id
++}
++
++func (h *xenHandle) WaitCh() chan *cstructs.WaitResult {
++	return h.waitCh
++}
++
++func (h *xenHandle) Update(task *structs.Task) error {
++	// Update is not possible
++	return nil
++}
++
++// Shut-down command
++func (h *xenHandle) Kill() error {
++	h.cmd.Shutdown()
++	select {
++	case <-h.doneCh:
++		return nil
++	case <-time.After(5 * time.Second):
++		return h.cmd.ForceStop()
++	}
++}
++
++// Run command
++func (h *xenHandle) run() {
++	res := h.cmd.Wait()
++	close(h.doneCh)
++	h.waitCh <- res
++	close(h.waitCh)
++}
+\ No newline at end of file
+-- 
+1.8.1.2
+
+
+From 945d25eb8805d165ca59a98b5fde03876e857132 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Thu, 25 Feb 2016 12:30:39 +0100
+Subject: [PATCH 02/15] Changes: - Add configuration files
+
+---
+ dist/canary_client.hcl | 17 +++++++++++++++++
+ dist/canary_dev.hcl    | 13 +++++++++++++
+ dist/canary_server.hcl | 16 ++++++++++++++++
+ 3 files changed, 46 insertions(+)
+ create mode 100644 dist/canary_client.hcl
+ create mode 100644 dist/canary_dev.hcl
+ create mode 100644 dist/canary_server.hcl
+
+diff --git a/dist/canary_client.hcl b/dist/canary_client.hcl
+new file mode 100644
+index 0000000..7631013
+--- /dev/null
++++ b/dist/canary_client.hcl
+@@ -0,0 +1,17 @@
++# Client has to run on canary
++
++# Increase log verbosity
++log_level = "DEBUG"
++
++# Setup data dir
++data_dir = "/tmp/canary_client"
++
++bind_addr = "160.80.105.4"
++
++# Enable the client
++client {
++    enabled = true
++
++    # This is the endpoint where run the Server
++    servers = ["160.80.103.45:4647"]
++}
+\ No newline at end of file
+diff --git a/dist/canary_dev.hcl b/dist/canary_dev.hcl
+new file mode 100644
+index 0000000..b7fe551
+--- /dev/null
++++ b/dist/canary_dev.hcl
+@@ -0,0 +1,13 @@
++# This deployment is only for dev, we have client and server in the same machine
++
++bind_addr = "160.80.105.4"
++data_dir = "/var/lib/canary_dev"
++
++server {
++  enabled = true
++  bootstrap_expect = 1
++}
++
++client {
++  enabled = true
++}
+diff --git a/dist/canary_server.hcl b/dist/canary_server.hcl
+new file mode 100644
+index 0000000..8c64e2b
+--- /dev/null
++++ b/dist/canary_server.hcl
+@@ -0,0 +1,16 @@
++# Server has to run in a different endpoint, for example in your laptop
++
++# Increase log verbosity
++log_level = "DEBUG"
++
++# Setup data dir
++data_dir = "/tmp/canary_server"
++
++bind_addr = "160.80.103.45"
++
++server {
++	enabled = true
++
++	# This is necessary for master election. In this case we have auto-proclamation
++	bootstrap_expect = 1
++}
+\ No newline at end of file
+-- 
+1.8.1.2
+
+
+From 39ee345cdc37664af6289a51bdfdb0363cb95e72 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Thu, 25 Feb 2016 18:32:44 +0100
+Subject: [PATCH 03/15] Changes: - Modified build
+
+---
+ client/driver/driver.go |  2 +-
+ client/driver/xen.go    | 62 ++++++++++++++++++++++++-------------------------
+ scripts/build.sh        |  6 +++--
+ 3 files changed, 36 insertions(+), 34 deletions(-)
+
+diff --git a/client/driver/driver.go b/client/driver/driver.go
+index a8d5443..88e54da 100644
+--- a/client/driver/driver.go
++++ b/client/driver/driver.go
+@@ -25,7 +25,7 @@ var BuiltinDrivers = map[string]Factory{
+ 	"java":     NewJavaDriver,
+ 	"qemu":     NewQemuDriver,
+ 	"rkt":      NewRktDriver,
+-	"xen":		NewXenDriver,
++	"xen":      NewXenDriver,
+ }
+ 
+ // NewDriver is used to instantiate and return a new driver
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index be6a4c5..2cd9313 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -16,8 +16,8 @@ import (
+ 
+ var (
+ 	reMajVersion = regexp.MustCompile(`xen_major:'d'`)
+-    	reMinVersion = regexp.MustCompile(`xen_minor:'d'`)
+-    	reExtVersion = regexp.MustCompile(`xen_extra:.'d'`)
++	reMinVersion = regexp.MustCompile(`xen_minor:'d'`)
++	reExtVersion = regexp.MustCompile(`xen_extra:.'d'`)
+ )
+ 
+ // XenDriver is a driver for running Xen.
+@@ -48,8 +48,8 @@ func NewXenDriver(ctx *DriverContext) Driver {
+ 
+ // Return the driver to be used
+ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+-bin := "xl"
+-	
++	bin := "xl"
++
+ 	outBytes, err := exec.Command(bin, "info").Output()
+ 	if err != nil {
+ 		return false, nil
+@@ -60,34 +60,34 @@ bin := "xl"
+ 	if len(matches1) != 2 {
+ 		return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches1)
+ 	}
+-    	matches2 := reMinVersion.FindStringSubmatch(out)
+-        if len(matches2) != 2 {
+-        	return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches2)
+-    	}
+-    	matches3 := reExtVersion.FindStringSubmatch(out)
+-        if len(matches3) != 2 {
+-        	return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches3)
+-    	}
++	matches2 := reMinVersion.FindStringSubmatch(out)
++	if len(matches2) != 2 {
++		return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches2)
++	}
++	matches3 := reExtVersion.FindStringSubmatch(out)
++	if len(matches3) != 2 {
++		return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches3)
++	}
+ 
+-    	matches := matches1[1]+"."+matches2[1]+"."+matches3[1]
++	matches := matches1[1] + "." + matches2[1] + "." + matches3[1]
+ 
+-	node.Attributes["driver.xen-hyp"] = "1"
+-	node.Attributes["driver.xen-hyp.version"] = matches
++	node.Attributes["driver.xen"] = "1"
++	node.Attributes["driver.xen.version"] = matches
+ 
+ 	return true, nil
+ }
+ 
+-
+ // Run an existing Xen image. Start() will pull down an existing, valid Xen
+ // image and save it to the Drivers Allocation Dir
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+ 	/*
+-	// Xen defaults to 256M of RAM for a given VM. Instead, we force users to
+-	// supply a memory size in the tasks resources
+-	if task.Resources == nil || task.Resources.MemoryMB == 0 {
+-		return nil, fmt.Errorf("Missing required Task Resource: Memory")
+-	}*/
+-	
++		// Xen defaults to 256M of RAM for a given VM. Instead, we force users to
++		// supply a memory size in the tasks resources
++		if task.Resources == nil || task.Resources.MemoryMB == 0 {
++			return nil, fmt.Errorf("Missing required Task Resource: Memory")
++		}*/
++
++
+ 	args := []string{
+                 "xl",
+                 "create",
+@@ -99,14 +99,14 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	d.logger.Printf("[DEBUG] Starting XenVM command: %q", strings.Join(args, " "))
+ 	
+ 	// Create and Return Handle
+-        h := &execHandle{
+-                cmd:    cmd,
+-                doneCh: make(chan struct{}),
+-                waitCh: make(chan *cstructs.WaitResult, 1),
+-        }
+-
+-        go h.run()
+-        return h, nil
++    h := &execHandle{
++            cmd:    cmd,
++            doneCh: make(chan struct{}),
++            waitCh: make(chan *cstructs.WaitResult, 1),
++    }
++
++    go h.run()
++    return h, nil
+ }
+ 
+ func (d *XenDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
+@@ -157,4 +157,4 @@ func (h *xenHandle) run() {
+ 	close(h.doneCh)
+ 	h.waitCh <- res
+ 	close(h.waitCh)
+-}
+\ No newline at end of file
++}
+diff --git a/scripts/build.sh b/scripts/build.sh
+index 90e6b08..3d07441 100755
+--- a/scripts/build.sh
++++ b/scripts/build.sh
+@@ -16,8 +16,10 @@ GIT_COMMIT=$(git rev-parse HEAD)
+ GIT_DIRTY=$(test -n "`git status --porcelain`" && echo "+CHANGES" || true)
+ 
+ # Determine the arch/os combos we're building for
+-XC_ARCH=${XC_ARCH:-"386 amd64 arm"}
+-XC_OS=${XC_OS:-linux darwin windows freebsd openbsd}
++#XC_ARCH=${XC_ARCH:-"386 amd64 arm"}
++#XC_OS=${XC_OS:-linux darwin windows freebsd openbsd}
++XC_ARCH="386"
++XC_OS=linux
+ 
+ # Delete the old dir
+ echo "==> Removing old directory..."
+-- 
+1.8.1.2
+
+
+From a37fdf998a8b5da062648a56434670e8cbb12186 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Thu, 25 Feb 2016 22:09:19 +0100
+Subject: [PATCH 04/15] Changes: - Refactoring of the xen code
+
+---
+ client/driver/xen.go | 344 ++++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 311 insertions(+), 33 deletions(-)
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index 2cd9313..b9b5870 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -1,16 +1,22 @@
+ package driver
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
++	"log"
+ 	"os/exec"
++	"path/filepath"
+ 	"regexp"
+ 	"strings"
+ 	"time"
+ 
++	"github.com/hashicorp/go-plugin"
++	"github.com/hashicorp/nomad/client/allocdir"
+ 	"github.com/hashicorp/nomad/client/config"
+ 	"github.com/hashicorp/nomad/client/driver/executor"
+ 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+ 	"github.com/hashicorp/nomad/client/fingerprint"
++	"github.com/hashicorp/nomad/helper/discover"
+ 	"github.com/hashicorp/nomad/nomad/structs"
+ )
+ 
+@@ -34,12 +40,28 @@ type XenDriverConfig struct {
+ 	PortMap        []map[string]int `mapstructure:"port_map"` // A map of host port labels and to guest ports.
+ }
+ 
+-// xenHandle is returned from Start/Open as a handle to the PID (identical to qemu and java).
++// old xenHandle is returned from Start/Open as a handle to the PID (identical to qemu and java).
++
++/*
+ type xenHandle struct {
+ 	cmd    executor.Executor
+ 	waitCh chan *cstructs.WaitResult
+ 	doneCh chan struct{}
+ }
++*/
++
++// xenHandle is returned from Start/Open as a handle to the PID (identical to qemu)
++// TODO verify if it is ok
++type xenHandle struct {
++	pluginClient *plugin.Client
++	userPid      int
++	executor     executor.Executor
++	allocDir     *allocdir.AllocDir
++	killTimeout  time.Duration
++	logger       *log.Logger
++	waitCh       chan *cstructs.WaitResult
++	doneCh       chan struct{}
++}
+ 
+ // NewXenDriver is used to create a new exec driver (identical to qemu and java).
+ func NewXenDriver(ctx *DriverContext) Driver {
+@@ -80,55 +102,263 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ // Run an existing Xen image. Start() will pull down an existing, valid Xen
+ // image and save it to the Drivers Allocation Dir
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
++
+ 	/*
++		Old code
+ 		// Xen defaults to 256M of RAM for a given VM. Instead, we force users to
+ 		// supply a memory size in the tasks resources
+ 		if task.Resources == nil || task.Resources.MemoryMB == 0 {
+ 			return nil, fmt.Errorf("Missing required Task Resource: Memory")
+-		}*/
++		}
++
++		args := []string{
++	                "xl",
++	                "create",
++	                "/root/clickos.cfg",
++		}
++
++		// Setup the command
++		cmd := executor.Command(args[0], args[1:]...)
++		d.logger.Printf("[DEBUG] Starting XenVM command: %q", strings.Join(args, " "))
++
++		// Create and Return Handle
++	    h := &execHandle{
++	            cmd:    cmd,
++	            doneCh: make(chan struct{}),
++	            waitCh: make(chan *cstructs.WaitResult, 1),
++	    }
++
++	    go h.run()
++	    return h, nil
++	*/
+ 
++	/*var driverConfig QemuDriverConfig
++	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
++		return nil, err
++	}
++
++	if len(driverConfig.PortMap) > 1 {
++		return nil, fmt.Errorf("Only one port_map block is allowed in the qemu driver config")
++	}
++
++	// Get the image source
++	source, ok := task.Config["artifact_source"]
++	if !ok || source == "" {
++		return nil, fmt.Errorf("Missing source image Qemu driver")
++	}
++
++	// Qemu defaults to 128M of RAM for a given VM. Instead, we force users to
++	// supply a memory size in the tasks resources
++	if task.Resources == nil || task.Resources.MemoryMB == 0 {
++		return nil, fmt.Errorf("Missing required Task Resource: Memory")
++	}
++	*/
++
++	// Get the tasks local directory.
++	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
++	if !ok {
++		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
++	}
++
++	// Proceed to download an artifact to be executed.
++	/*
++		vmPath, err := getter.GetArtifact(
++			taskDir,
++			driverConfig.ArtifactSource,
++			driverConfig.Checksum,
++			d.logger,
++		)
++		if err != nil {
++			return nil, err
++		}
++
++		vmID := filepath.Base(vmPath)
++
++		// Parse configuration arguments
++		// Create the base arguments
++		accelerator := "tcg"
++		if driverConfig.Accelerator != "" {
++			accelerator = driverConfig.Accelerator
++		}
++		// TODO: Check a lower bounds, e.g. the default 128 of Qemu
++		mem := fmt.Sprintf("%dM", task.Resources.MemoryMB)
++	*/
+ 
+ 	args := []string{
+-                "xl",
+-                "create",
+-                "/root/clickos.cfg",
+-	}
+-	
+-	// Setup the command
+-	cmd := executor.Command(args[0], args[1:]...)
+-	d.logger.Printf("[DEBUG] Starting XenVM command: %q", strings.Join(args, " "))
+-	
++		"xl",
++		"create",
++		"/root/clickos.cfg",
++	}
++
++	/*
++		// Check the Resources required Networks to add port mappings. If no resources
++		// are required, we assume the VM is a purely compute job and does not require
++		// the outside world to be able to reach it. VMs ran without port mappings can
++		// still reach out to the world, but without port mappings it is effectively
++		// firewalled
++		protocols := []string{"udp", "tcp"}
++		if len(task.Resources.Networks) > 0 && len(driverConfig.PortMap) == 1 {
++			// Loop through the port map and construct the hostfwd string, to map
++			// reserved ports to the ports listenting in the VM
++			// Ex: hostfwd=tcp::22000-:22,hostfwd=tcp::80-:8080
++			var forwarding []string
++			taskPorts := task.Resources.Networks[0].MapLabelToValues(nil)
++			for label, guest := range driverConfig.PortMap[0] {
++				host, ok := taskPorts[label]
++				if !ok {
++					return nil, fmt.Errorf("Unknown port label %q", label)
++				}
++
++				for _, p := range protocols {
++					forwarding = append(forwarding, fmt.Sprintf("hostfwd=%s::%d-:%d", p, host, guest))
++				}
++			}
++
++			if len(forwarding) != 0 {
++				args = append(args,
++					"-netdev",
++					fmt.Sprintf("user,id=user.0,%s", strings.Join(forwarding, ",")),
++					"-device", "virtio-net,netdev=user.0",
++				)
++			}
++		}
++
++		// If using KVM, add optimization args
++		if accelerator == "kvm" {
++			args = append(args,
++				"-enable-kvm",
++				"-cpu", "host",
++				// Do we have cores information available to the Driver?
++				// "-smp", fmt.Sprintf("%d", cores),
++			)
++		}*/
++
++	d.logger.Printf("[DEBUG] Starting xenVM command: %q", strings.Join(args, " "))
++	bin, err := discover.NomadExecutable()
++	if err != nil {
++		return nil, fmt.Errorf("unable to find the nomad binary: %v", err)
++	}
++
++	pluginLogFile := filepath.Join(taskDir, fmt.Sprintf("%s-executor.out", task.Name))
++	pluginConfig := &plugin.ClientConfig{
++		Cmd: exec.Command(bin, "executor", pluginLogFile),
++	}
++
++	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
++	if err != nil {
++		return nil, err
++	}
++	executorCtx := &executor.ExecutorContext{
++		TaskEnv:       d.taskEnv,
++		AllocDir:      ctx.AllocDir,
++		TaskName:      task.Name,
++		TaskResources: task.Resources,
++		LogConfig:     task.LogConfig,
++	}
++	t1 := time.Now()
++	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: args[0], Args: args[1:]}, executorCtx)
++	if err != nil {
++		pluginClient.Kill()
++		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
++	}
++	t2 := time.Now()
++	duration := t2.Sub(t1)
++	d.logger.Printf("[INFO] Started new xenVM in:", duration)
++
+ 	// Create and Return Handle
+-    h := &execHandle{
+-            cmd:    cmd,
+-            doneCh: make(chan struct{}),
+-            waitCh: make(chan *cstructs.WaitResult, 1),
+-    }
+-
+-    go h.run()
+-    return h, nil
++	h := &xenHandle{
++		pluginClient: pluginClient,
++		executor:     exec,
++		userPid:      ps.Pid,
++		allocDir:     ctx.AllocDir,
++		killTimeout:  d.DriverContext.KillTimeout(task),
++		logger:       d.logger,
++		doneCh:       make(chan struct{}),
++		waitCh:       make(chan *cstructs.WaitResult, 1),
++	}
++
++	go h.run()
++	return h, nil
++}
++
++type xenId struct {
++	KillTimeout  time.Duration
++	UserPid      int
++	PluginConfig *PluginReattachConfig
++	AllocDir     *allocdir.AllocDir
+ }
+ 
+ func (d *XenDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
+-	// Find the process
+-	cmd, err := executor.OpenId(handleID)
++	/*
++		Old Process
++		// Find the process
++		cmd, err := executor.OpenId(handleID)
++		if err != nil {
++			return nil, fmt.Errorf("failed to open ID %v: %v", handleID, err)
++		}
++
++		// Return a driver handle
++		h := &execHandle{
++			cmd:    cmd,
++			doneCh: make(chan struct{}),
++			waitCh: make(chan *cstructs.WaitResult, 1),
++		}
++		go h.run()
++		return h, nil
++	*/
++
++	id := &xenId{}
++	if err := json.Unmarshal([]byte(handleID), id); err != nil {
++		return nil, fmt.Errorf("Failed to parse handle '%s': %v", handleID, err)
++	}
++
++	pluginConfig := &plugin.ClientConfig{
++		Reattach: id.PluginConfig.PluginConfig(),
++	}
++
++	executor, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to open ID %v: %v", handleID, err)
++		d.logger.Println("[ERROR] driver.xen: error connecting to plugin so destroying plugin pid and user pid")
++		if e := destroyPlugin(id.PluginConfig.Pid, id.UserPid); e != nil {
++			d.logger.Printf("[ERROR] driver.xen: error destroying plugin and userpid: %v", e)
++		}
++		return nil, fmt.Errorf("error connecting to plugin: %v", err)
+ 	}
+ 
+ 	// Return a driver handle
+-	h := &execHandle{
+-		cmd:    cmd,
+-		doneCh: make(chan struct{}),
+-		waitCh: make(chan *cstructs.WaitResult, 1),
++	h := &xenHandle{
++		pluginClient: pluginClient,
++		executor:     executor,
++		userPid:      id.UserPid,
++		allocDir:     id.AllocDir,
++		logger:       d.logger,
++		killTimeout:  id.KillTimeout,
++		doneCh:       make(chan struct{}),
++		waitCh:       make(chan *cstructs.WaitResult, 1),
+ 	}
+ 	go h.run()
+ 	return h, nil
++
+ }
+ 
+ func (h *xenHandle) ID() string {
+-	id, _ := h.cmd.ID()
+-	return id
++	/*
++		Old code
++		id, _ := h.cmd.ID()
++		return id
++	*/
++	id := xenId{
++		KillTimeout:  h.killTimeout,
++		PluginConfig: NewPluginReattachConfig(h.pluginClient.ReattachConfig()),
++		UserPid:      h.userPid,
++		AllocDir:     h.allocDir,
++	}
++
++	data, err := json.Marshal(id)
++	if err != nil {
++		h.logger.Printf("[ERR] driver.xen: failed to marshal ID to JSON: %s", err)
++	}
++	return string(data)
+ }
+ 
+ func (h *xenHandle) WaitCh() chan *cstructs.WaitResult {
+@@ -136,25 +366,73 @@ func (h *xenHandle) WaitCh() chan *cstructs.WaitResult {
+ }
+ 
+ func (h *xenHandle) Update(task *structs.Task) error {
++	/*
++		Old code
++		// Update is not possible
++		return nil
++	*/
++	// Store the updated kill timeout.
++	h.killTimeout = task.KillTimeout
++	h.executor.UpdateLogConfig(task.LogConfig)
++
+ 	// Update is not possible
+ 	return nil
+ }
+ 
+ // Shut-down command
+ func (h *xenHandle) Kill() error {
+-	h.cmd.Shutdown()
++	/*
++		Old code
++		h.cmd.Shutdown()
++		select {
++		case <-h.doneCh:
++			return nil
++		case <-time.After(5 * time.Second):
++			return h.cmd.ForceStop()
++		}*/
++	if err := h.executor.ShutDown(); err != nil {
++		if h.pluginClient.Exited() {
++			return nil
++		}
++		return fmt.Errorf("executor Shutdown failed: %v", err)
++	}
++
+ 	select {
+ 	case <-h.doneCh:
+ 		return nil
+-	case <-time.After(5 * time.Second):
+-		return h.cmd.ForceStop()
++	case <-time.After(h.killTimeout):
++		if h.pluginClient.Exited() {
++			return nil
++		}
++		if err := h.executor.Exit(); err != nil {
++			return fmt.Errorf("executor Exit failed: %v", err)
++		}
++
++		return nil
+ 	}
+ }
+ 
+ // Run command
+ func (h *xenHandle) run() {
+-	res := h.cmd.Wait()
++	/*
++		Old code
++		res := h.cmd.Wait()
++		close(h.doneCh)
++		h.waitCh <- res
++		close(h.waitCh)
++	*/
++	ps, err := h.executor.Wait()
++	if ps.ExitCode == 0 && err != nil {
++		if e := killProcess(h.userPid); e != nil {
++			h.logger.Printf("[ERROR] driver.xen: error killing user process: %v", e)
++		}
++		if e := h.allocDir.UnmountAll(); e != nil {
++			h.logger.Printf("[ERROR] driver.xen: unmounting dev,proc and alloc dirs failed: %v", e)
++		}
++	}
+ 	close(h.doneCh)
+-	h.waitCh <- res
++	h.waitCh <- &cstructs.WaitResult{ExitCode: ps.ExitCode, Signal: 0, Err: err}
+ 	close(h.waitCh)
++	h.pluginClient.Kill()
++
+ }
+-- 
+1.8.1.2
+
+
+From 7ee1bbb5525fbffa5f89b5712112c795dbf43198 Mon Sep 17 00:00:00 2001
+From: canary <canary@debian>
+Date: Sat, 27 Feb 2016 21:18:17 +0100
+Subject: [PATCH 05/15] Changes: - fix driver fingerprint
+
+---
+ client/driver/xen.go | 65 ++++++++++++++++++++++++++--------------------------
+ dist/canary_dev.hcl  |  4 +++-
+ 2 files changed, 35 insertions(+), 34 deletions(-)
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index b9b5870..d50cacb 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -21,9 +21,9 @@ import (
+ )
+ 
+ var (
+-	reMajVersion = regexp.MustCompile(`xen_major:'d'`)
+-	reMinVersion = regexp.MustCompile(`xen_minor:'d'`)
+-	reExtVersion = regexp.MustCompile(`xen_extra:.'d'`)
++	reMajVersion = regexp.MustCompile(`xen_major\s+:\s([1-9])`)
++	reMinVersion = regexp.MustCompile(`xen_minor\s+:\s([1-9])`)
++	reExtVersion = regexp.MustCompile(`xen_extra\s+:\s.([1-9])`)
+ )
+ 
+ // XenDriver is a driver for running Xen.
+@@ -77,18 +77,17 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ 		return false, nil
+ 	}
+ 	out := strings.TrimSpace(string(outBytes))
+-
+ 	matches1 := reMajVersion.FindStringSubmatch(out)
+ 	if len(matches1) != 2 {
+-		return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches1)
++		return false, fmt.Errorf("Unable to parse Xen major version string: %#v", matches1)
+ 	}
+ 	matches2 := reMinVersion.FindStringSubmatch(out)
+ 	if len(matches2) != 2 {
+-		return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches2)
++		return false, fmt.Errorf("Unable to parse Xen minor version string: %#v", matches2)
+ 	}
+ 	matches3 := reExtVersion.FindStringSubmatch(out)
+ 	if len(matches3) != 2 {
+-		return false, fmt.Errorf("Unable to parse Xen version string: %#v", matches3)
++		return false, fmt.Errorf("Unable to parse Xen extra version string: %#v", matches3)
+ 	}
+ 
+ 	matches := matches1[1] + "." + matches2[1] + "." + matches3[1]
+@@ -104,32 +103,32 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+ 
+ 	/*
+-		Old code
+-		// Xen defaults to 256M of RAM for a given VM. Instead, we force users to
+-		// supply a memory size in the tasks resources
+-		if task.Resources == nil || task.Resources.MemoryMB == 0 {
+-			return nil, fmt.Errorf("Missing required Task Resource: Memory")
+-		}
++			Old code
++			// Xen defaults to 256M of RAM for a given VM. Instead, we force users to
++			// supply a memory size in the tasks resources
++			if task.Resources == nil || task.Resources.MemoryMB == 0 {
++				return nil, fmt.Errorf("Missing required Task Resource: Memory")
++			}
+ 
+-		args := []string{
+-	                "xl",
+-	                "create",
+-	                "/root/clickos.cfg",
+-		}
++			args := []string{
++		                "xl",
++		                "create",
++		                "/root/clickos.cfg",
++			}
+ 
+-		// Setup the command
+-		cmd := executor.Command(args[0], args[1:]...)
+-		d.logger.Printf("[DEBUG] Starting XenVM command: %q", strings.Join(args, " "))
++			// Setup the command
++			cmd := executor.Command(args[0], args[1:]...)
++			d.logger.Printf("[DEBUG] Starting XenVM command: %q", strings.Join(args, " "))
+ 
+-		// Create and Return Handle
+-	    h := &execHandle{
+-	            cmd:    cmd,
+-	            doneCh: make(chan struct{}),
+-	            waitCh: make(chan *cstructs.WaitResult, 1),
+-	    }
++			// Create and Return Handle
++		    h := &execHandle{
++		            cmd:    cmd,
++		            doneCh: make(chan struct{}),
++		            waitCh: make(chan *cstructs.WaitResult, 1),
++		    }
+ 
+-	    go h.run()
+-	    return h, nil
++		    go h.run()
++		    return h, nil
+ 	*/
+ 
+ 	/*var driverConfig QemuDriverConfig
+@@ -185,9 +184,9 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	*/
+ 
+ 	args := []string{
+-		"xl",
+-		"create",
+-		"/root/clickos.cfg",
++		"pwd",
++		" ",
++		//"/root/clickos.cfg",
+ 	}
+ 
+ 	/*
+@@ -263,7 +262,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	}
+ 	t2 := time.Now()
+ 	duration := t2.Sub(t1)
+-	d.logger.Printf("[INFO] Started new xenVM in:", duration)
++	d.logger.Printf("[INFO] Started new xenVM in:%v\n", duration)
+ 
+ 	// Create and Return Handle
+ 	h := &xenHandle{
+diff --git a/dist/canary_dev.hcl b/dist/canary_dev.hcl
+index b7fe551..06a988d 100644
+--- a/dist/canary_dev.hcl
++++ b/dist/canary_dev.hcl
+@@ -1,6 +1,8 @@
+ # This deployment is only for dev, we have client and server in the same machine
+ 
+-bind_addr = "160.80.105.4"
++# Increase log verbosity
++log_level = "DEBUG"
++
+ data_dir = "/var/lib/canary_dev"
+ 
+ server {
+-- 
+1.8.1.2
+
+
+From 2573b7002b55296e4184ec9349c3cef929b3cf14 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Sat, 27 Feb 2016 21:52:33 +0100
+Subject: [PATCH 06/15] Changes: - add download of the artifacts
+
+---
+ client/driver/xen.go | 56 +++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 31 insertions(+), 25 deletions(-)
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index d50cacb..2ad8cd0 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -16,8 +16,10 @@ import (
+ 	"github.com/hashicorp/nomad/client/driver/executor"
+ 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+ 	"github.com/hashicorp/nomad/client/fingerprint"
++	"github.com/hashicorp/nomad/client/getter"
+ 	"github.com/hashicorp/nomad/helper/discover"
+ 	"github.com/hashicorp/nomad/nomad/structs"
++	"github.com/mitchellh/mapstructure"
+ )
+ 
+ var (
+@@ -131,14 +133,16 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		    return h, nil
+ 	*/
+ 
+-	/*var driverConfig QemuDriverConfig
++	var driverConfig QemuDriverConfig
+ 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+ 		return nil, err
+ 	}
+ 
+-	if len(driverConfig.PortMap) > 1 {
+-		return nil, fmt.Errorf("Only one port_map block is allowed in the qemu driver config")
+-	}
++	/*
++		if len(driverConfig.PortMap) > 1 {
++			return nil, fmt.Errorf("Only one port_map block is allowed in the qemu driver config")
++		}
++	*/
+ 
+ 	// Get the image source
+ 	source, ok := task.Config["artifact_source"]
+@@ -148,9 +152,10 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 
+ 	// Qemu defaults to 128M of RAM for a given VM. Instead, we force users to
+ 	// supply a memory size in the tasks resources
+-	if task.Resources == nil || task.Resources.MemoryMB == 0 {
+-		return nil, fmt.Errorf("Missing required Task Resource: Memory")
+-	}
++	/*
++		if task.Resources == nil || task.Resources.MemoryMB == 0 {
++			return nil, fmt.Errorf("Missing required Task Resource: Memory")
++		}
+ 	*/
+ 
+ 	// Get the tasks local directory.
+@@ -160,21 +165,22 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	}
+ 
+ 	// Proceed to download an artifact to be executed.
+-	/*
+-		vmPath, err := getter.GetArtifact(
+-			taskDir,
+-			driverConfig.ArtifactSource,
+-			driverConfig.Checksum,
+-			d.logger,
+-		)
+-		if err != nil {
+-			return nil, err
+-		}
+ 
+-		vmID := filepath.Base(vmPath)
++	vmPath, err := getter.GetArtifact(
++		taskDir,
++		driverConfig.ArtifactSource,
++		driverConfig.Checksum,
++		d.logger,
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	vmID := filepath.Base(vmPath)
+ 
+-		// Parse configuration arguments
+-		// Create the base arguments
++	// Parse configuration arguments
++	// Create the base arguments
++	/*
+ 		accelerator := "tcg"
+ 		if driverConfig.Accelerator != "" {
+ 			accelerator = driverConfig.Accelerator
+@@ -184,9 +190,9 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	*/
+ 
+ 	args := []string{
+-		"pwd",
+-		" ",
+-		//"/root/clickos.cfg",
++		"xl",
++		"create ",
++		"clickos.cfg",
+ 	}
+ 
+ 	/*
+@@ -262,7 +268,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	}
+ 	t2 := time.Now()
+ 	duration := t2.Sub(t1)
+-	d.logger.Printf("[INFO] Started new xenVM in:%v\n", duration)
++	d.logger.Printf("[INFO] Started new xenVM %s in:%v\n", vmID, duration)
+ 
+ 	// Create and Return Handle
+ 	h := &xenHandle{
+@@ -289,7 +295,7 @@ type xenId struct {
+ 
+ func (d *XenDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
+ 	/*
+-		Old Process
++		Old code
+ 		// Find the process
+ 		cmd, err := executor.OpenId(handleID)
+ 		if err != nil {
+-- 
+1.8.1.2
+
+
+From f7aa300004f95fa9073d0ae8b5b17ae728c0cd13 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Sat, 27 Feb 2016 22:22:03 +0100
+Subject: [PATCH 07/15] Changes: - Add the download of cfg - Add the download
+ of clickos img
+
+---
+ client/driver/xen.go | 40 ++++++++++++++++++++++++++++------------
+ 1 file changed, 28 insertions(+), 12 deletions(-)
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index 2ad8cd0..99e4faf 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -36,10 +36,11 @@ type XenDriver struct {
+ 
+ // Configuration for XenDriver
+ type XenDriverConfig struct {
+-	ArtifactSource string           `mapstructure:"artifact_source"`
+-	Checksum       string           `mapstructure:"checksum"`
+-	Accelerator    string           `mapstructure:"accelerator"`
+-	PortMap        []map[string]int `mapstructure:"port_map"` // A map of host port labels and to guest ports.
++	CfgSource   string           `mapstructure:"cfg_source"`
++	ImgSource   string           `mapstructure:"img_source"`
++	Checksum    string           `mapstructure:"checksum"`
++	Accelerator string           `mapstructure:"accelerator"`
++	PortMap     []map[string]int `mapstructure:"port_map"` // A map of host port labels and to guest ports.
+ }
+ 
+ // old xenHandle is returned from Start/Open as a handle to the PID (identical to qemu and java).
+@@ -133,7 +134,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		    return h, nil
+ 	*/
+ 
+-	var driverConfig QemuDriverConfig
++	var driverConfig XenDriverConfig
+ 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+ 		return nil, err
+ 	}
+@@ -144,10 +145,16 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		}
+ 	*/
+ 
+-	// Get the image source
+-	source, ok := task.Config["artifact_source"]
+-	if !ok || source == "" {
+-		return nil, fmt.Errorf("Missing source image Qemu driver")
++	// Get the cfg source
++	cfg_source, ok := task.Config["cfg_source"]
++	if !ok || cfg_source == "" {
++		return nil, fmt.Errorf("Missing source cfg Xen driver")
++	}
++
++	// Get the img source
++	img_source, ok := task.Config["img_source"]
++	if !ok || img_source == "" {
++		return nil, fmt.Errorf("Missing source image Xen driver")
+ 	}
+ 
+ 	// Qemu defaults to 128M of RAM for a given VM. Instead, we force users to
+@@ -165,10 +172,19 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	}
+ 
+ 	// Proceed to download an artifact to be executed.
++	cfgPath, err := getter.GetArtifact(
++		taskDir,
++		driverConfig.CfgSource,
++		driverConfig.Checksum,
++		d.logger,
++	)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	vmPath, err := getter.GetArtifact(
+ 		taskDir,
+-		driverConfig.ArtifactSource,
++		driverConfig.ImgSource,
+ 		driverConfig.Checksum,
+ 		d.logger,
+ 	)
+@@ -191,7 +207,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 
+ 	args := []string{
+ 		"xl",
+-		"create ",
++		"create",
+ 		"clickos.cfg",
+ 	}
+ 
+@@ -268,7 +284,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	}
+ 	t2 := time.Now()
+ 	duration := t2.Sub(t1)
+-	d.logger.Printf("[INFO] Started new xenVM %s in:%v\n", vmID, duration)
++	d.logger.Printf("[INFO] Started new xenVM %s using cfg%s in:%v\n", vmID, cfgPath, duration)
+ 
+ 	// Create and Return Handle
+ 	h := &xenHandle{
+-- 
+1.8.1.2
+
+
+From de1d58e7682fbd494937eebd7664f450707eeabe Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Sun, 28 Feb 2016 10:51:33 +0100
+Subject: [PATCH 08/15] Changes: - Refine download artifacts - Add timings
+ breakdown
+
+---
+ client/driver/xen.go | 61 +++++++++++++++++++++++++---------------------------
+ 1 file changed, 29 insertions(+), 32 deletions(-)
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index 99e4faf..2259388 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -73,8 +73,8 @@ func NewXenDriver(ctx *DriverContext) Driver {
+ 
+ // Return the driver to be used
+ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+-	bin := "xl"
+ 
++	bin := "xl"
+ 	outBytes, err := exec.Command(bin, "info").Output()
+ 	if err != nil {
+ 		return false, nil
+@@ -106,34 +106,14 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+ 
+ 	/*
+-			Old code
+-			// Xen defaults to 256M of RAM for a given VM. Instead, we force users to
+-			// supply a memory size in the tasks resources
+-			if task.Resources == nil || task.Resources.MemoryMB == 0 {
+-				return nil, fmt.Errorf("Missing required Task Resource: Memory")
+-			}
+-
+-			args := []string{
+-		                "xl",
+-		                "create",
+-		                "/root/clickos.cfg",
+-			}
+-
+-			// Setup the command
+-			cmd := executor.Command(args[0], args[1:]...)
+-			d.logger.Printf("[DEBUG] Starting XenVM command: %q", strings.Join(args, " "))
+-
+-			// Create and Return Handle
+-		    h := &execHandle{
+-		            cmd:    cmd,
+-		            doneCh: make(chan struct{}),
+-		            waitCh: make(chan *cstructs.WaitResult, 1),
+-		    }
++		- TODO
++		- Complete Driver;
++		- cfg in the code;
++		- different toolstack
+ 
+-		    go h.run()
+-		    return h, nil
+ 	*/
+-
++	t0 := time.Now()
++	t1 := t0
+ 	var driverConfig XenDriverConfig
+ 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+ 		return nil, err
+@@ -157,6 +137,10 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		return nil, fmt.Errorf("Missing source image Xen driver")
+ 	}
+ 
++	t2 := time.Now()
++	duration := t2.Sub(t1)
++	d.logger.Printf("[INFO] loaded new XenDriverConfig in:%v\n", duration)
++
+ 	// Qemu defaults to 128M of RAM for a given VM. Instead, we force users to
+ 	// supply a memory size in the tasks resources
+ 	/*
+@@ -166,12 +150,17 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	*/
+ 
+ 	// Get the tasks local directory.
++	t1 = time.Now()
+ 	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
+ 	if !ok {
+ 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
+ 	}
++	t2 = time.Now()
++	duration = t2.Sub(t1)
++	d.logger.Printf("[INFO] Allocated new TaskDir in:%v\n", duration)
+ 
+ 	// Proceed to download an artifact to be executed.
++	t1 = time.Now()
+ 	cfgPath, err := getter.GetArtifact(
+ 		taskDir,
+ 		driverConfig.CfgSource,
+@@ -191,7 +180,11 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	t2 = time.Now()
++	duration = t2.Sub(t1)
++	d.logger.Printf("[INFO] Downloaded XenArtifacts (cfg and image) in:%v\n", duration)
+ 
++	cfgID := filepath.Base(cfgPath)
+ 	vmID := filepath.Base(vmPath)
+ 
+ 	// Parse configuration arguments
+@@ -208,7 +201,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	args := []string{
+ 		"xl",
+ 		"create",
+-		"clickos.cfg",
++		cfgID,
+ 	}
+ 
+ 	/*
+@@ -276,15 +269,19 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		TaskResources: task.Resources,
+ 		LogConfig:     task.LogConfig,
+ 	}
+-	t1 := time.Now()
++	t2 = time.Now()
++	duration = t2.Sub(t0)
++	d.logger.Printf("[INFO] Init Completed in:%v\n", duration)
++
++	t1 = time.Now()
+ 	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: args[0], Args: args[1:]}, executorCtx)
+ 	if err != nil {
+ 		pluginClient.Kill()
+ 		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+ 	}
+-	t2 := time.Now()
+-	duration := t2.Sub(t1)
+-	d.logger.Printf("[INFO] Started new xenVM %s using cfg%s in:%v\n", vmID, cfgPath, duration)
++	t2 = time.Now()
++	duration = t2.Sub(t1)
++	d.logger.Printf("[INFO] Started new xenVM %s using cfg %s in:%v\n", vmID, cfgID, duration)
+ 
+ 	// Create and Return Handle
+ 	h := &xenHandle{
+-- 
+1.8.1.2
+
+
+From 2f32ae892f55b3752d4c3a77d886772394afff49 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Mon, 29 Feb 2016 09:28:10 +0100
+Subject: [PATCH 09/15] Changes: - Improve time recording
+
+---
+ client/driver/xen.go | 27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index 2259388..6f6f797 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -26,6 +26,8 @@ var (
+ 	reMajVersion = regexp.MustCompile(`xen_major\s+:\s([1-9])`)
+ 	reMinVersion = regexp.MustCompile(`xen_minor\s+:\s([1-9])`)
+ 	reExtVersion = regexp.MustCompile(`xen_extra\s+:\s.([1-9])`)
++	tstart       time.Time
++	tend         time.Time
+ )
+ 
+ // XenDriver is a driver for running Xen.
+@@ -101,17 +103,18 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ 	return true, nil
+ }
+ 
++/*
++	- TODO
++	- Complete Driver;
++	- cfg in the code;
++	- different toolstack
++
++*/
++
+ // Run an existing Xen image. Start() will pull down an existing, valid Xen
+ // image and save it to the Drivers Allocation Dir
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+ 
+-	/*
+-		- TODO
+-		- Complete Driver;
+-		- cfg in the code;
+-		- different toolstack
+-
+-	*/
+ 	t0 := time.Now()
+ 	t1 := t0
+ 	var driverConfig XenDriverConfig
+@@ -271,17 +274,14 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	}
+ 	t2 = time.Now()
+ 	duration = t2.Sub(t0)
+-	d.logger.Printf("[INFO] Init Completed in:%v\n", duration)
++	d.logger.Printf("[INFO] Init Completed in:%v. Starting new XenVM %s using %s\n", duration, vmID, cfgID)
+ 
+-	t1 = time.Now()
++	tstart = time.Now()
+ 	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: args[0], Args: args[1:]}, executorCtx)
+ 	if err != nil {
+ 		pluginClient.Kill()
+ 		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+ 	}
+-	t2 = time.Now()
+-	duration = t2.Sub(t1)
+-	d.logger.Printf("[INFO] Started new xenVM %s using cfg %s in:%v\n", vmID, cfgID, duration)
+ 
+ 	// Create and Return Handle
+ 	h := &xenHandle{
+@@ -440,6 +440,9 @@ func (h *xenHandle) run() {
+ 		close(h.waitCh)
+ 	*/
+ 	ps, err := h.executor.Wait()
++	tend := time.Now()
++	duration := tend.Sub(tstart)
++	h.logger.Printf("[INFO] Started new xenVM in %v\n", duration)
+ 	if ps.ExitCode == 0 && err != nil {
+ 		if e := killProcess(h.userPid); e != nil {
+ 			h.logger.Printf("[ERROR] driver.xen: error killing user process: %v", e)
+-- 
+1.8.1.2
+
+
+From 2cf58e82aa7c78bfa363b317723b60e649c4ab9e Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Tue, 1 Mar 2016 13:34:34 +0100
+Subject: [PATCH 10/15] Changes: - Improve time recording on client - Add
+ configuration files for local client and local server
+
+---
+ client/driver/xen.go  | 30 +++++++++---------------------
+ dist/local_client.hcl | 21 +++++++++++++++++++++
+ dist/local_server.hcl | 14 ++++++++++++++
+ 3 files changed, 44 insertions(+), 21 deletions(-)
+ create mode 100644 dist/local_client.hcl
+ create mode 100644 dist/local_server.hcl
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index 6f6f797..84136fe 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -26,8 +26,6 @@ var (
+ 	reMajVersion = regexp.MustCompile(`xen_major\s+:\s([1-9])`)
+ 	reMinVersion = regexp.MustCompile(`xen_minor\s+:\s([1-9])`)
+ 	reExtVersion = regexp.MustCompile(`xen_extra\s+:\s.([1-9])`)
+-	tstart       time.Time
+-	tend         time.Time
+ )
+ 
+ // XenDriver is a driver for running Xen.
+@@ -66,6 +64,7 @@ type xenHandle struct {
+ 	logger       *log.Logger
+ 	waitCh       chan *cstructs.WaitResult
+ 	doneCh       chan struct{}
++	tstart       time.Time
+ }
+ 
+ // NewXenDriver is used to create a new exec driver (identical to qemu and java).
+@@ -115,8 +114,7 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ // image and save it to the Drivers Allocation Dir
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+ 
+-	t0 := time.Now()
+-	t1 := t0
++	tstart := time.Now()
+ 	var driverConfig XenDriverConfig
+ 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+ 		return nil, err
+@@ -140,9 +138,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		return nil, fmt.Errorf("Missing source image Xen driver")
+ 	}
+ 
+-	t2 := time.Now()
+-	duration := t2.Sub(t1)
+-	d.logger.Printf("[INFO] loaded new XenDriverConfig in:%v\n", duration)
++	d.logger.Printf("[DEBUG] loaded new XenDriverConfig")
+ 
+ 	// Qemu defaults to 128M of RAM for a given VM. Instead, we force users to
+ 	// supply a memory size in the tasks resources
+@@ -153,17 +149,13 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	*/
+ 
+ 	// Get the tasks local directory.
+-	t1 = time.Now()
+ 	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
+ 	if !ok {
+ 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
+ 	}
+-	t2 = time.Now()
+-	duration = t2.Sub(t1)
+-	d.logger.Printf("[INFO] Allocated new TaskDir in:%v\n", duration)
++	d.logger.Printf("[DEBUG] Allocated new TaskDir")
+ 
+ 	// Proceed to download an artifact to be executed.
+-	t1 = time.Now()
+ 	cfgPath, err := getter.GetArtifact(
+ 		taskDir,
+ 		driverConfig.CfgSource,
+@@ -183,9 +175,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	t2 = time.Now()
+-	duration = t2.Sub(t1)
+-	d.logger.Printf("[INFO] Downloaded XenArtifacts (cfg and image) in:%v\n", duration)
++	d.logger.Printf("[DEBUG] Downloaded XenArtifacts (cfg and image)")
+ 
+ 	cfgID := filepath.Base(cfgPath)
+ 	vmID := filepath.Base(vmPath)
+@@ -272,11 +262,8 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		TaskResources: task.Resources,
+ 		LogConfig:     task.LogConfig,
+ 	}
+-	t2 = time.Now()
+-	duration = t2.Sub(t0)
+-	d.logger.Printf("[INFO] Init Completed in:%v. Starting new XenVM %s using %s\n", duration, vmID, cfgID)
++	d.logger.Printf("[DEBUG] Init Completed. Starting new XenVM %s using %s\n", vmID, cfgID)
+ 
+-	tstart = time.Now()
+ 	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: args[0], Args: args[1:]}, executorCtx)
+ 	if err != nil {
+ 		pluginClient.Kill()
+@@ -285,6 +272,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 
+ 	// Create and Return Handle
+ 	h := &xenHandle{
++		tstart:       tstart,
+ 		pluginClient: pluginClient,
+ 		executor:     exec,
+ 		userPid:      ps.Pid,
+@@ -441,8 +429,8 @@ func (h *xenHandle) run() {
+ 	*/
+ 	ps, err := h.executor.Wait()
+ 	tend := time.Now()
+-	duration := tend.Sub(tstart)
+-	h.logger.Printf("[INFO] Started new xenVM in %v\n", duration)
++	duration := tend.Sub(h.tstart)
++	h.logger.Printf("[DEBUG] Started new xenVM in %v\n", duration)
+ 	if ps.ExitCode == 0 && err != nil {
+ 		if e := killProcess(h.userPid); e != nil {
+ 			h.logger.Printf("[ERROR] driver.xen: error killing user process: %v", e)
+diff --git a/dist/local_client.hcl b/dist/local_client.hcl
+new file mode 100644
+index 0000000..badd2f6
+--- /dev/null
++++ b/dist/local_client.hcl
+@@ -0,0 +1,21 @@
++# Client has to run on canary
++
++# Increase log verbosity
++log_level = "DEBUG"
++
++# Setup data dir
++data_dir = "/tmp/local_client"
++
++# Enable the client
++client {
++	enabled = true
++	servers = ["127.0.0.1:4647"]
++}
++
++ports {
++
++http = 5656
++rpc = 5657
++serf = 5658
++
++}
+diff --git a/dist/local_server.hcl b/dist/local_server.hcl
+new file mode 100644
+index 0000000..cab0858
+--- /dev/null
++++ b/dist/local_server.hcl
+@@ -0,0 +1,14 @@
++# Server has to run in a different endpoint, for example in your laptop
++
++# Increase log verbosity
++log_level = "DEBUG"
++
++# Setup data dir
++data_dir = "/tmp/canary_server"
++
++server {
++	enabled = true
++
++	# This is necessary for master election. In this case we have auto-proclamation
++	bootstrap_expect = 1
++}
+-- 
+1.8.1.2
+
+
+From cda10af024305cf3a0b3de1e97f038b15b706d96 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Fri, 18 Mar 2016 17:25:44 +0100
+Subject: [PATCH 11/15] Changes: - Clean xen driver - Add configuration files
+ for local deployment and NeST deployment - Add a simple bash benchmark - Add
+ utility to unmount and delete fake file system
+
+---
+ client/driver/xen.go      | 13 +------------
+ dist/canary_client.hcl    |  2 +-
+ dist/canary_dev.hcl       |  2 +-
+ dist/local_server.hcl     |  2 +-
+ dist/sparrow_server.hcl   | 16 ++++++++++++++++
+ dist/test/clean           | 15 +++++++++++++++
+ dist/test/example1.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example10.nomad | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example2.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example3.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example4.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example5.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example6.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example7.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example8.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/example9.nomad  | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ dist/test/run_nomad_test  | 31 +++++++++++++++++++++++++++++++
+ 17 files changed, 526 insertions(+), 15 deletions(-)
+ create mode 100644 dist/sparrow_server.hcl
+ create mode 100755 dist/test/clean
+ create mode 100644 dist/test/example1.nomad
+ create mode 100644 dist/test/example10.nomad
+ create mode 100644 dist/test/example2.nomad
+ create mode 100644 dist/test/example3.nomad
+ create mode 100644 dist/test/example4.nomad
+ create mode 100644 dist/test/example5.nomad
+ create mode 100644 dist/test/example6.nomad
+ create mode 100644 dist/test/example7.nomad
+ create mode 100644 dist/test/example8.nomad
+ create mode 100644 dist/test/example9.nomad
+ create mode 100755 dist/test/run_nomad_test
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index 84136fe..9d1a4a3 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -64,7 +64,6 @@ type xenHandle struct {
+ 	logger       *log.Logger
+ 	waitCh       chan *cstructs.WaitResult
+ 	doneCh       chan struct{}
+-	tstart       time.Time
+ }
+ 
+ // NewXenDriver is used to create a new exec driver (identical to qemu and java).
+@@ -114,7 +113,6 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ // image and save it to the Drivers Allocation Dir
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+ 
+-	tstart := time.Now()
+ 	var driverConfig XenDriverConfig
+ 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+ 		return nil, err
+@@ -138,8 +136,6 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		return nil, fmt.Errorf("Missing source image Xen driver")
+ 	}
+ 
+-	d.logger.Printf("[DEBUG] loaded new XenDriverConfig")
+-
+ 	// Qemu defaults to 128M of RAM for a given VM. Instead, we force users to
+ 	// supply a memory size in the tasks resources
+ 	/*
+@@ -153,7 +149,6 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	if !ok {
+ 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
+ 	}
+-	d.logger.Printf("[DEBUG] Allocated new TaskDir")
+ 
+ 	// Proceed to download an artifact to be executed.
+ 	cfgPath, err := getter.GetArtifact(
+@@ -175,7 +170,6 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	d.logger.Printf("[DEBUG] Downloaded XenArtifacts (cfg and image)")
+ 
+ 	cfgID := filepath.Base(cfgPath)
+ 	vmID := filepath.Base(vmPath)
+@@ -262,17 +256,15 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		TaskResources: task.Resources,
+ 		LogConfig:     task.LogConfig,
+ 	}
+-	d.logger.Printf("[DEBUG] Init Completed. Starting new XenVM %s using %s\n", vmID, cfgID)
+-
+ 	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: args[0], Args: args[1:]}, executorCtx)
+ 	if err != nil {
+ 		pluginClient.Kill()
+ 		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+ 	}
++	d.logger.Printf("[DEBUG] Started new XenVM %s using %s\n", vmID, cfgID)
+ 
+ 	// Create and Return Handle
+ 	h := &xenHandle{
+-		tstart:       tstart,
+ 		pluginClient: pluginClient,
+ 		executor:     exec,
+ 		userPid:      ps.Pid,
+@@ -428,9 +420,6 @@ func (h *xenHandle) run() {
+ 		close(h.waitCh)
+ 	*/
+ 	ps, err := h.executor.Wait()
+-	tend := time.Now()
+-	duration := tend.Sub(h.tstart)
+-	h.logger.Printf("[DEBUG] Started new xenVM in %v\n", duration)
+ 	if ps.ExitCode == 0 && err != nil {
+ 		if e := killProcess(h.userPid); e != nil {
+ 			h.logger.Printf("[ERROR] driver.xen: error killing user process: %v", e)
+diff --git a/dist/canary_client.hcl b/dist/canary_client.hcl
+index 7631013..b114765 100644
+--- a/dist/canary_client.hcl
++++ b/dist/canary_client.hcl
+@@ -13,5 +13,5 @@ client {
+     enabled = true
+ 
+     # This is the endpoint where run the Server
+-    servers = ["160.80.103.45:4647"]
++    servers = ["160.80.105.5:4647"]
+ }
+\ No newline at end of file
+diff --git a/dist/canary_dev.hcl b/dist/canary_dev.hcl
+index 06a988d..2909d1a 100644
+--- a/dist/canary_dev.hcl
++++ b/dist/canary_dev.hcl
+@@ -3,7 +3,7 @@
+ # Increase log verbosity
+ log_level = "DEBUG"
+ 
+-data_dir = "/var/lib/canary_dev"
++data_dir = "/tmp/canary_dev"
+ 
+ server {
+   enabled = true
+diff --git a/dist/local_server.hcl b/dist/local_server.hcl
+index cab0858..d6c16f3 100644
+--- a/dist/local_server.hcl
++++ b/dist/local_server.hcl
+@@ -4,7 +4,7 @@
+ log_level = "DEBUG"
+ 
+ # Setup data dir
+-data_dir = "/tmp/canary_server"
++data_dir = "/tmp/local_server"
+ 
+ server {
+ 	enabled = true
+diff --git a/dist/sparrow_server.hcl b/dist/sparrow_server.hcl
+new file mode 100644
+index 0000000..294378a
+--- /dev/null
++++ b/dist/sparrow_server.hcl
+@@ -0,0 +1,16 @@
++# Server has to run in a different endpoint, for example in your laptop
++
++# Increase log verbosity
++log_level = "DEBUG"
++
++# Setup data dir
++data_dir = "/tmp/canary_server"
++
++bind_addr = "160.80.105.5"
++
++server {
++	enabled = true
++
++	# This is necessary for master election. In this case we have auto-proclamation
++	bootstrap_expect = 1
++}
+\ No newline at end of file
+diff --git a/dist/test/clean b/dist/test/clean
+new file mode 100755
+index 0000000..1698260
+--- /dev/null
++++ b/dist/test/clean
+@@ -0,0 +1,15 @@
++#!/bin/bash
++
++targets=($(cat /proc/mounts | grep /tmp/local_client))
++
++for i in ${targets[@]};
++do
++if [[ $i == *"/tmp/local_client"* ]]
++then
++  umount $i
++fi
++done
++
++rm -r /tmp/local_client/
++rm -r /tmp/local_server/
++rm -r /tmp/plugin*
+diff --git a/dist/test/example1.nomad b/dist/test/example1.nomad
+new file mode 100644
+index 0000000..4f5d0e3
+--- /dev/null
++++ b/dist/test/example1.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example1" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java1" {
++
++		# Define a task to run
++		task "web1" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example10.nomad b/dist/test/example10.nomad
+new file mode 100644
+index 0000000..30f9229
+--- /dev/null
++++ b/dist/test/example10.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example10" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java10" {
++
++		# Define a task to run
++		task "web10" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example2.nomad b/dist/test/example2.nomad
+new file mode 100644
+index 0000000..a798303
+--- /dev/null
++++ b/dist/test/example2.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example2" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java2" {
++
++		# Define a task to run
++		task "web2" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example3.nomad b/dist/test/example3.nomad
+new file mode 100644
+index 0000000..5a9ebc7
+--- /dev/null
++++ b/dist/test/example3.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example3" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java3" {
++
++		# Define a task to run
++		task "web3" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example4.nomad b/dist/test/example4.nomad
+new file mode 100644
+index 0000000..19c02a7
+--- /dev/null
++++ b/dist/test/example4.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example4" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java4" {
++
++		# Define a task to run
++		task "web4" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example5.nomad b/dist/test/example5.nomad
+new file mode 100644
+index 0000000..f0c4700
+--- /dev/null
++++ b/dist/test/example5.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example5" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java5" {
++
++		# Define a task to run
++		task "web5" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example6.nomad b/dist/test/example6.nomad
+new file mode 100644
+index 0000000..8769045
+--- /dev/null
++++ b/dist/test/example6.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example6" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java6" {
++
++		# Define a task to run
++		task "web6" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example7.nomad b/dist/test/example7.nomad
+new file mode 100644
+index 0000000..31df9f5
+--- /dev/null
++++ b/dist/test/example7.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example7" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java7" {
++
++		# Define a task to run
++		task "web7" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example8.nomad b/dist/test/example8.nomad
+new file mode 100644
+index 0000000..f1327d4
+--- /dev/null
++++ b/dist/test/example8.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example8" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java8" {
++
++		# Define a task to run
++		task "web8" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/example9.nomad b/dist/test/example9.nomad
+new file mode 100644
+index 0000000..ea817d2
+--- /dev/null
++++ b/dist/test/example9.nomad
+@@ -0,0 +1,46 @@
++# There can only be a single job definition per file.
++# Create a job with ID and Name 'example'
++job "example9" {
++	# Run the job in the global region, which is the default.
++	# region = "global"
++
++    	type = "batch"
++
++
++	# Specify the datacenters within the region this job can run in.
++	datacenters = ["dc1"]
++
++	constraint {
++		attribute = "${attr.kernel.name}"
++		value = "linux"
++	}
++
++	# Configure the job to do rolling updates
++	update {
++		# Stagger updates every 10 seconds
++		stagger = "10s"
++
++		# Update a single task at a time
++		max_parallel = 1
++	}
++
++	# Create a 'cache' group. Each task in the group will be
++	# scheduled onto the same machine.
++	group "java9" {
++
++		# Define a task to run
++		task "web9" {
++			# Run a Java Jar
++			driver = "java"
++			config {
++				artifact_source = "http://160.80.105.5/helloworld.jar"
++				jvm_options = ["-Xmx2048m", "-Xms256m"]
++			}
++			resources {
++				cpu = 500 # 500 Mhz
++				memory = 256 # 256MB
++			}
++
++		}
++	}
++}
+diff --git a/dist/test/run_nomad_test b/dist/test/run_nomad_test
+new file mode 100755
+index 0000000..23d6b00
+--- /dev/null
++++ b/dist/test/run_nomad_test
+@@ -0,0 +1,31 @@
++#!/bin/bash
++
++i="1"
++j="10"
++while [ $i -le $j ]
++do
++	echo -e "RUN"
++	START=$(date +%s.%N)
++	sudo nomad run -detach "example$i.nomad"
++	#sudo nomad run "example$i.nomad"
++	END=$(date +%s.%N)
++	DIFF=$(echo "($END - $START)*1000" | bc)
++	echo -e "Executed in $DIFF ms"
++	#sleep 0.01
++	i=$[$i+1]
++done
++
++#sleep 30 
++
++#i="1"
++#while [ $i -le 1 ]
++#do
++#        echo -e "STOP"
++#        START=$(date +%s.%N)
++#        sudo nomad stop "example$i"
++#        END=$(date +%s.%N)
++#        DIFF=$(echo "($END - $START)*1000" | bc)
++#        echo -e "Executed in $DIFF ms"
++#        i=$[$i+1]
++#done
++
+-- 
+1.8.1.2
+
+
+From 5cf7b9bfb4649091e6588511b69be34740b7fcb5 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Fri, 18 Mar 2016 19:46:39 +0100
+Subject: [PATCH 12/15] Changes: - Fix some problems
+
+---
+ dist/sparrow_server.hcl  |  2 +-
+ dist/test/clean          | 14 +++++++++-----
+ dist/test/run_nomad_test | 22 +++++-----------------
+ 3 files changed, 15 insertions(+), 23 deletions(-)
+
+diff --git a/dist/sparrow_server.hcl b/dist/sparrow_server.hcl
+index 294378a..993a69f 100644
+--- a/dist/sparrow_server.hcl
++++ b/dist/sparrow_server.hcl
+@@ -4,7 +4,7 @@
+ log_level = "DEBUG"
+ 
+ # Setup data dir
+-data_dir = "/tmp/canary_server"
++data_dir = "/tmp/sparrow_server"
+ 
+ bind_addr = "160.80.105.5"
+ 
+diff --git a/dist/test/clean b/dist/test/clean
+index 1698260..8b7e451 100755
+--- a/dist/test/clean
++++ b/dist/test/clean
+@@ -1,15 +1,19 @@
+ #!/bin/bash
+ 
+-targets=($(cat /proc/mounts | grep /tmp/local_client))
++CLI_PATH=/tmp/local_client
++SER_PATH=/tmp/local_server/
++PLU_PATH=/tmp/plugin*
++
++targets=($(cat /proc/mounts | grep $CLI_PATH))
+ 
+ for i in ${targets[@]};
+ do
+-if [[ $i == *"/tmp/local_client"* ]]
++if [[ $i == *"$CLI_PATH"* ]]
+ then
+   umount $i
+ fi
+ done
+ 
+-rm -r /tmp/local_client/
+-rm -r /tmp/local_server/
+-rm -r /tmp/plugin*
++rm -r $CLI_PATH
++rm -r $SER_PATH
++rm -r $PLU_PATH
+diff --git a/dist/test/run_nomad_test b/dist/test/run_nomad_test
+index 23d6b00..aa3c29d 100755
+--- a/dist/test/run_nomad_test
++++ b/dist/test/run_nomad_test
+@@ -2,30 +2,18 @@
+ 
+ i="1"
+ j="10"
++
++SERVER_ADDRESS=http://160.80.105.5:4646
++
+ while [ $i -le $j ]
+ do
+ 	echo -e "RUN"
+ 	START=$(date +%s.%N)
+-	sudo nomad run -detach "example$i.nomad"
++	sudo nomad run -detach -address=$SERVER_ADDRESS "example$i.nomad"
+ 	#sudo nomad run "example$i.nomad"
+ 	END=$(date +%s.%N)
+ 	DIFF=$(echo "($END - $START)*1000" | bc)
+ 	echo -e "Executed in $DIFF ms"
+ 	#sleep 0.01
+ 	i=$[$i+1]
+-done
+-
+-#sleep 30 
+-
+-#i="1"
+-#while [ $i -le 1 ]
+-#do
+-#        echo -e "STOP"
+-#        START=$(date +%s.%N)
+-#        sudo nomad stop "example$i"
+-#        END=$(date +%s.%N)
+-#        DIFF=$(echo "($END - $START)*1000" | bc)
+-#        echo -e "Executed in $DIFF ms"
+-#        i=$[$i+1]
+-#done
+-
++done
+\ No newline at end of file
+-- 
+1.8.1.2
+
+
+From 4a8dfbe49374878c5079b7e6a6f0bdad6108f01e Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Fri, 18 Mar 2016 19:47:17 +0100
+Subject: [PATCH 13/15] Changes: - Delete old cfg
+
+---
+ dist/canary_server.hcl | 16 ----------------
+ 1 file changed, 16 deletions(-)
+ delete mode 100644 dist/canary_server.hcl
+
+diff --git a/dist/canary_server.hcl b/dist/canary_server.hcl
+deleted file mode 100644
+index 8c64e2b..0000000
+--- a/dist/canary_server.hcl
++++ /dev/null
+@@ -1,16 +0,0 @@
+-# Server has to run in a different endpoint, for example in your laptop
+-
+-# Increase log verbosity
+-log_level = "DEBUG"
+-
+-# Setup data dir
+-data_dir = "/tmp/canary_server"
+-
+-bind_addr = "160.80.103.45"
+-
+-server {
+-	enabled = true
+-
+-	# This is necessary for master election. In this case we have auto-proclamation
+-	bootstrap_expect = 1
+-}
+\ No newline at end of file
+-- 
+1.8.1.2
+
+
+From 845f2d8b7a48ace02f05a209b17bf1be870e8afe Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Mon, 9 May 2016 13:04:25 +0200
+Subject: [PATCH 14/15] Changes: - Add timings breakdown in XenDriver code
+
+---
+ client/driver/xen.go | 85 +++++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 77 insertions(+), 8 deletions(-)
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index 9d1a4a3..c71425f 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"log"
++	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"regexp"
+@@ -56,14 +57,18 @@ type xenHandle struct {
+ // xenHandle is returned from Start/Open as a handle to the PID (identical to qemu)
+ // TODO verify if it is ok
+ type xenHandle struct {
+-	pluginClient *plugin.Client
+-	userPid      int
+-	executor     executor.Executor
+-	allocDir     *allocdir.AllocDir
+-	killTimeout  time.Duration
+-	logger       *log.Logger
+-	waitCh       chan *cstructs.WaitResult
+-	doneCh       chan struct{}
++	pluginClient  *plugin.Client
++	userPid       int
++	executor      executor.Executor
++	allocDir      *allocdir.AllocDir
++	killTimeout   time.Duration
++	logger        *log.Logger
++	waitCh        chan *cstructs.WaitResult
++	doneCh        chan struct{}
++	get_config    time.Duration
++	alloc_dir     time.Duration
++	down_artifact time.Duration
++	init_env      time.Duration
+ }
+ 
+ // NewXenDriver is used to create a new exec driver (identical to qemu and java).
+@@ -113,6 +118,8 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
+ // image and save it to the Drivers Allocation Dir
+ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+ 
++	start_config := time.Now()
++
+ 	var driverConfig XenDriverConfig
+ 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+ 		return nil, err
+@@ -136,6 +143,8 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		return nil, fmt.Errorf("Missing source image Xen driver")
+ 	}
+ 
++	end_config := time.Now()
++
+ 	// Qemu defaults to 128M of RAM for a given VM. Instead, we force users to
+ 	// supply a memory size in the tasks resources
+ 	/*
+@@ -144,12 +153,18 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		}
+ 	*/
+ 
++	start_allocDir := time.Now()
++
+ 	// Get the tasks local directory.
+ 	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
+ 	if !ok {
+ 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
+ 	}
+ 
++	end_allocDir := time.Now()
++
++	start_downArtifact := time.Now()
++
+ 	// Proceed to download an artifact to be executed.
+ 	cfgPath, err := getter.GetArtifact(
+ 		taskDir,
+@@ -174,6 +189,8 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 	cfgID := filepath.Base(cfgPath)
+ 	vmID := filepath.Base(vmPath)
+ 
++	end_downArtificat := time.Now()
++
+ 	// Parse configuration arguments
+ 	// Create the base arguments
+ 	/*
+@@ -185,6 +202,8 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		mem := fmt.Sprintf("%dM", task.Resources.MemoryMB)
+ 	*/
+ 
++	start_init_env := time.Now()
++
+ 	args := []string{
+ 		"xl",
+ 		"create",
+@@ -275,6 +294,13 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
+ 		waitCh:       make(chan *cstructs.WaitResult, 1),
+ 	}
+ 
++	end_init_env := time.Now()
++
++	h.get_config = end_config.Sub(start_config)
++	h.alloc_dir = end_allocDir.Sub(start_allocDir)
++	h.down_artifact = end_downArtificat.Sub(start_downArtifact)
++	h.init_env = end_init_env.Sub(start_init_env)
++
+ 	go h.run()
+ 	return h, nil
+ }
+@@ -419,7 +445,14 @@ func (h *xenHandle) run() {
+ 		h.waitCh <- res
+ 		close(h.waitCh)
+ 	*/
++	start_spawn := time.Now()
++
+ 	ps, err := h.executor.Wait()
++
++	end_spawn := time.Now()
++
++	start_clean := time.Now()
++
+ 	if ps.ExitCode == 0 && err != nil {
+ 		if e := killProcess(h.userPid); e != nil {
+ 			h.logger.Printf("[ERROR] driver.xen: error killing user process: %v", e)
+@@ -433,4 +466,40 @@ func (h *xenHandle) run() {
+ 	close(h.waitCh)
+ 	h.pluginClient.Kill()
+ 
++	end_clean := time.Now()
++
++	f, err := os.OpenFile("nomad_timestamps.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
++	if err != nil {
++		panic(err)
++	}
++
++	spawn := end_spawn.Sub(start_spawn)
++	clean := end_clean.Sub(start_clean)
++
++	defer f.Close()
++
++	if _, err = f.WriteString(fmt.Sprintf("get_config: %v", h.get_config)); err != nil {
++		panic(err)
++	}
++
++	if _, err = f.WriteString(fmt.Sprintf("alloc_dir: %v", h.alloc_dir)); err != nil {
++		panic(err)
++	}
++
++	if _, err = f.WriteString(fmt.Sprintf("down_artifact: %v", h.down_artifact)); err != nil {
++		panic(err)
++	}
++
++	if _, err = f.WriteString(fmt.Sprintf("init_env: %v", h.init_env)); err != nil {
++		panic(err)
++	}
++
++	if _, err = f.WriteString(fmt.Sprintf("spawn: %v", spawn)); err != nil {
++		panic(err)
++	}
++
++	if _, err = f.WriteString(fmt.Sprintf("clean: %v", clean)); err != nil {
++		panic(err)
++	}
++
+ }
+-- 
+1.8.1.2
+
+
+From 3773cfe6acd45fa91b122fdf6e323a66d206cbf3 Mon Sep 17 00:00:00 2001
+From: Pier Luigi Ventre <pierventre@hotmail.com>
+Date: Mon, 16 May 2016 11:37:44 +0200
+Subject: [PATCH 15/15] Change: - Fix timestamps - add xen job example
+
+---
+ client/driver/xen.go     | 55 +++++++++++++++++++++++++++++++++++++++---------
+ dist/test/xen-test.nomad | 27 ++++++++++++++++++++++++
+ 2 files changed, 72 insertions(+), 10 deletions(-)
+ create mode 100644 dist/test/xen-test.nomad
+
+diff --git a/client/driver/xen.go b/client/driver/xen.go
+index c71425f..ae47d9e 100644
+--- a/client/driver/xen.go
++++ b/client/driver/xen.go
+@@ -468,37 +468,72 @@ func (h *xenHandle) run() {
+ 
+ 	end_clean := time.Now()
+ 
+-	f, err := os.OpenFile("nomad_timestamps.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
++	spawn := end_spawn.Sub(start_spawn)
++	clean := end_clean.Sub(start_clean)
++
++	f1, err := os.OpenFile("get_config.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+ 	if err != nil {
+ 		panic(err)
+ 	}
+ 
+-	spawn := end_spawn.Sub(start_spawn)
+-	clean := end_clean.Sub(start_clean)
++	defer f1.Close()
++
++	f2, err := os.OpenFile("alloc_dir.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
++	if err != nil {
++		panic(err)
++	}
++
++	defer f2.Close()
++
++	f3, err := os.OpenFile("down_artifact.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
++	if err != nil {
++		panic(err)
++	}
++
++	defer f3.Close()
++
++	f4, err := os.OpenFile("init_env.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
++	if err != nil {
++		panic(err)
++	}
++
++	defer f4.Close()
++
++	f5, err := os.OpenFile("spawn.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
++	if err != nil {
++		panic(err)
++	}
++
++	defer f5.Close()
++
++	f6, err := os.OpenFile("clean.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
++	if err != nil {
++		panic(err)
++	}
+ 
+-	defer f.Close()
++	defer f6.Close()
+ 
+-	if _, err = f.WriteString(fmt.Sprintf("get_config: %v", h.get_config)); err != nil {
++	if _, err = f1.WriteString(fmt.Sprintf("%v\n", float64(h.get_config.Nanoseconds())/1000000)); err != nil {
+ 		panic(err)
+ 	}
+ 
+-	if _, err = f.WriteString(fmt.Sprintf("alloc_dir: %v", h.alloc_dir)); err != nil {
++	if _, err = f2.WriteString(fmt.Sprintf("%v\n", float64(h.alloc_dir.Nanoseconds())/1000000)); err != nil {
+ 		panic(err)
+ 	}
+ 
+-	if _, err = f.WriteString(fmt.Sprintf("down_artifact: %v", h.down_artifact)); err != nil {
++	if _, err = f3.WriteString(fmt.Sprintf("%v\n", float64(h.down_artifact.Nanoseconds())/1000000)); err != nil {
+ 		panic(err)
+ 	}
+ 
+-	if _, err = f.WriteString(fmt.Sprintf("init_env: %v", h.init_env)); err != nil {
++	if _, err = f4.WriteString(fmt.Sprintf("%v\n", float64(h.init_env.Nanoseconds())/1000000)); err != nil {
+ 		panic(err)
+ 	}
+ 
+-	if _, err = f.WriteString(fmt.Sprintf("spawn: %v", spawn)); err != nil {
++	if _, err = f5.WriteString(fmt.Sprintf("%v\n", float64(spawn.Nanoseconds())/1000000)); err != nil {
+ 		panic(err)
+ 	}
+ 
+-	if _, err = f.WriteString(fmt.Sprintf("clean: %v", clean)); err != nil {
++	if _, err = f6.WriteString(fmt.Sprintf("%v\n", float64(clean.Nanoseconds())/1000000)); err != nil {
+ 		panic(err)
+ 	}
+ 
+diff --git a/dist/test/xen-test.nomad b/dist/test/xen-test.nomad
+new file mode 100644
+index 0000000..a85aa5b
+--- /dev/null
++++ b/dist/test/xen-test.nomad
+@@ -0,0 +1,27 @@
++job "xen-test" {
++    datacenters = ["dc1"]
++    type = "batch"
++
++    constraint {
++	attribute = "${attr.kernel.name}"
++	value = "linux"
++    }
++
++    group "test" {
++
++	task "clickos-2048" {
++        
++	    driver = "xen"
++
++	    config = {
++            	img_source = "http://160.80.105.5/clickos_x86_64"
++		cfg_source = "http://160.80.105.5/clickos2048.cfg"
++            }	
++
++            resources {
++                cpu = 500 # 500 Mhz
++                memory = 256 # 256MB
++            }
++        }
++    }
++}
+\ No newline at end of file
+-- 
+1.8.1.2
+
