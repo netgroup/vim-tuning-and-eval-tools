@@ -26,9 +26,32 @@ Tips
 
 We report some suggestions useful to handle the code:
 - **NOMAD_tuned.patch** depends on NOMAD.patch. 
-- **NOMAD.patch** depends on commit 7f4140758ee0660e23303305a2634ef442a76114
+- **NOMAD.patch** depends on commit 7f4140758ee0660e23303305a2634ef442a76114.
+- It is necessary to install all the dependecies of the Python scripts.
+- It is necessary to install all the dependecies of the GO program. 
+- **nomad_pusher.go** depens on xen_job.json
 
 Usage
 ==============
 
 We report the usage of our scripts:
+
+- For nomad_driver_analyzer.py, it is necessary to put the necessary input in the folder ./nomad_traces and then run the command:
+		
+		./nomad_driver_analyzer.py
+
+- For nomad_packet_analyzer.py, it is necessary to put the necessary packets traces in the folder ./nomad_traces and then run the command:
+		
+		./nomad_packets_analyzer.py
+
+- For nomad_pusher.jo, it is necessary to create a main program like this:
+
+		package main
+
+		import (
+		    "github.com/user_xxx/our_go_files"
+		)
+
+		func main() {
+		    pushers.NomadJobPusher("xen", 100)
+		}

@@ -1,0 +1,70 @@
+{
+    "Job": {
+        "Region": "global",
+        "ID": "example",
+        "Name": "example",
+        "Type": "batch",
+        "Priority": 50,
+        "AllAtOnce": false,
+        "Datacenters": [
+            "dc1"
+        ],
+        "Constraints": [
+            {
+                "LTarget": "${attr.kernel.name}",
+                "RTarget": "linux",
+                "Operand": "="
+            }
+        ],
+        "TaskGroups": [
+            {
+                "Name": "xen",
+                "Count": 1,
+                "Constraints": null,
+                "Tasks": [
+                    {
+                        "Name": "clickos",
+                        "Driver": "xen",
+                        "Config": {
+                            "img_source": "http://160.80.105.5/clickos_x86_64",
+                            "cfg_source": "http://160.80.105.5/clickos.cfg"
+                        },
+                        "Constraints": null,
+                        "Env": null,
+                        "Services": null,
+                        "Resources": {
+                            "CPU": 20,
+                            "MemoryMB": 10,
+                            "DiskMB": 20,
+                            "IOPS": 0,
+                            "Networks": null
+                        },
+                        "Meta": null,
+                        "KillTimeout": 5000000000,
+                        "LogConfig": {
+                            "MaxFiles": 1,
+                            "MaxFileSizeMB": 10
+                        }
+                    }
+                ],
+                "RestartPolicy": {
+                    "Interval": 604800000000000,
+                    "Attempts": 15,
+                    "Delay": 15000000000,
+                    "Mode": "delay"
+                },
+                "Meta": null
+            }
+        ],
+        "Update": {
+            "Stagger": 10000000000,
+            "MaxParallel": 1
+        },
+        "Periodic": null,
+        "Meta": null,
+        "Status": "",
+        "StatusDescription": "",
+        "CreateIndex": 0,
+        "ModifyIndex": 0
+    }
+}
